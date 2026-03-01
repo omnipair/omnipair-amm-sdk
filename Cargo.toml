@@ -3,6 +3,8 @@ name = "omnipair-amm-sdk"
 version = "0.1.0"
 edition = "2021"
 description = "SDK for interacting with Omnipair AMM, built for Jupiter"
+license = "MIT"
+repository = "https://github.com/omnipair/omnipair-amm-sdk"
 
 [dependencies]
 anchor-lang = "0.31.1"
