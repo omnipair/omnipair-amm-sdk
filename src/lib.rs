@@ -1,10 +1,13 @@
-use anchor_lang::prelude::{AccountMeta, AnchorDeserialize, Pubkey};
-use anyhow::{Context, Result, bail};
+use anchor_lang::prelude::{AnchorDeserialize, Pubkey};
+use anyhow::{bail, Context, Result};
 use jupiter_amm_interface::{
-    AccountMap, Amm, AmmContext, AmmProgramIdToLabel, KeyedAccount, Quote, Swap,
-    SwapAndAccountMetas, SwapMode, SwapParams,
+    AccountMap, Amm, AmmContext, KeyedAccount, Quote, Swap, SwapAndAccountMetas, SwapMode,
+    SwapParams,
 };
 use rust_decimal::Decimal;
+
+mod omnipair_amm_client;
+pub use omnipair_amm_client::{OmnipairAmmClient, OmnipairSwapAccounts};
 
 pub const OMNIPAIR_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("omnixgS8fnqHfCcTGKWj6JtKjzpJZ1Y5y9pyFkQDkYE");
@@ -14,8 +17,8 @@ pub const TOKEN_2022_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
 const BPS_DENOMINATOR: u128 = 10_000;
-const RESERVE_VAULT_SEED_PREFIX: &[u8] = b"reserve_vault";
-const FUTARCHY_AUTHORITY_SEED_PREFIX: &[u8] = b"futarchy_authority";
+pub(crate) const RESERVE_VAULT_SEED_PREFIX: &[u8] = b"reserve_vault";
+pub(crate) const FUTARCHY_AUTHORITY_SEED_PREFIX: &[u8] = b"futarchy_authority";
 
 fn ceil_div(numerator: u128, denominator: u128) -> Option<u128> {
     if denominator == 0 {
@@ -103,11 +106,7 @@ pub struct SwapQuote {
 
 impl OmnipairPair {
     /// Constant-product swap: Δy = (Δx * y) / (x + Δx)
-    pub fn calculate_amount_out(
-        reserve_in: u64,
-        reserve_out: u64,
-        amount_in: u64,
-    ) -> Result<u64> {
+    pub fn calculate_amount_out(reserve_in: u64, reserve_out: u64, amount_in: u64) -> Result<u64> {
         let denominator = (reserve_in as u128)
             .checked_add(amount_in as u128)
             .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))?;
@@ -142,7 +141,8 @@ impl OmnipairPair {
                 .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))?,
             BPS_DENOMINATOR,
         )
-        .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))? as u64;
+        .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))?
+            as u64;
 
         let amount_in_after_fee = amount_in
             .checked_sub(fee_amount)
@@ -154,65 +154,11 @@ impl OmnipairPair {
             bail!(OmnipairError::InsufficientCashReserve);
         }
 
-        Ok(SwapQuote { amount_out, fee_amount })
+        Ok(SwapQuote {
+            amount_out,
+            fee_amount,
+        })
     }
-}
-
-// ---------------------------------------------------------------------------
-// Derived accounts -- computed once from pair state, reused across calls
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct DerivedAccounts {
-    reserve_vault0: Pubkey,
-    reserve_vault1: Pubkey,
-    futarchy_authority: Pubkey,
-    event_authority: Pubkey,
-}
-
-impl DerivedAccounts {
-    fn compute(pair_key: &Pubkey, state: &OmnipairPair) -> Self {
-        let (reserve_vault0, _) = Pubkey::find_program_address(
-            &[RESERVE_VAULT_SEED_PREFIX, pair_key.as_ref(), state.token0.as_ref()],
-            &OMNIPAIR_PROGRAM_ID,
-        );
-        let (reserve_vault1, _) = Pubkey::find_program_address(
-            &[RESERVE_VAULT_SEED_PREFIX, pair_key.as_ref(), state.token1.as_ref()],
-            &OMNIPAIR_PROGRAM_ID,
-        );
-        let (futarchy_authority, _) = Pubkey::find_program_address(
-            &[FUTARCHY_AUTHORITY_SEED_PREFIX],
-            &OMNIPAIR_PROGRAM_ID,
-        );
-        let (event_authority, _) = Pubkey::find_program_address(
-            &[b"__event_authority"],
-            &OMNIPAIR_PROGRAM_ID,
-        );
-        Self { reserve_vault0, reserve_vault1, futarchy_authority, event_authority }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Jupiter Amm implementation -- thin wrapper that delegates to OmnipairPair
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct OmnipairAmmClient {
-    pub pair_key: Pubkey,
-    pub state: OmnipairPair,
-    derived: DerivedAccounts,
-}
-
-impl AmmProgramIdToLabel for OmnipairAmmClient {
-    const PROGRAM_ID_TO_LABELS: &[(Pubkey, jupiter_amm_interface::AmmLabel)] =
-        &[(OMNIPAIR_PROGRAM_ID, "Omnipair")];
-}
-
-fn deserialize_pair(data: &[u8]) -> Result<OmnipairPair> {
-    if data.len() < 8 {
-        bail!(OmnipairError::InvalidAccountData);
-    }
-    Ok(OmnipairPair::deserialize(&mut &data[8..])?)
 }
 
 impl Amm for OmnipairAmmClient {
@@ -220,9 +166,13 @@ impl Amm for OmnipairAmmClient {
     where
         Self: Sized,
     {
-        let state = deserialize_pair(&keyed_account.account.data)?;
-        let derived = DerivedAccounts::compute(&keyed_account.key, &state);
-        Ok(Self { pair_key: keyed_account.key, state, derived })
+        let state = omnipair_amm_client::deserialize_pair(&keyed_account.account.data)?;
+        let derived = omnipair_amm_client::DerivedAccounts::compute(&keyed_account.key, &state);
+        Ok(Self {
+            pair_key: keyed_account.key,
+            state,
+            derived,
+        })
     }
 
     fn label(&self) -> String {
@@ -246,11 +196,11 @@ impl Amm for OmnipairAmmClient {
     }
 
     fn update(&mut self, account_map: &AccountMap) -> Result<()> {
-        let pair_account = account_map.get(&self.pair_key).with_context(|| {
-            format!("Pair account not found for key: {}", self.pair_key)
-        })?;
-        self.state = deserialize_pair(&pair_account.data)?;
-        self.derived = DerivedAccounts::compute(&self.pair_key, &self.state);
+        let pair_account = account_map
+            .get(&self.pair_key)
+            .with_context(|| format!("Pair account not found for key: {}", self.pair_key))?;
+        self.state = omnipair_amm_client::deserialize_pair(&pair_account.data)?;
+        self.derived = omnipair_amm_client::DerivedAccounts::compute(&self.pair_key, &self.state);
         Ok(())
     }
 
@@ -263,7 +213,9 @@ impl Amm for OmnipairAmmClient {
             bail!(OmnipairError::ExactOutNotSupported);
         }
 
-        let result = self.state.swap_quote(quote_params.amount, quote_params.input_mint)?;
+        let result = self
+            .state
+            .swap_quote(quote_params.amount, quote_params.input_mint)?;
 
         Ok(Quote {
             in_amount: quote_params.amount,
@@ -278,9 +230,19 @@ impl Amm for OmnipairAmmClient {
         let is_token0_in = swap_params.source_mint == self.state.token0;
 
         let (token_in_mint, token_out_mint, token_in_vault, token_out_vault) = if is_token0_in {
-            (self.state.token0, self.state.token1, self.derived.reserve_vault0, self.derived.reserve_vault1)
+            (
+                self.state.token0,
+                self.state.token1,
+                self.derived.reserve_vault0,
+                self.derived.reserve_vault1,
+            )
         } else {
-            (self.state.token1, self.state.token0, self.derived.reserve_vault1, self.derived.reserve_vault0)
+            (
+                self.state.token1,
+                self.state.token0,
+                self.derived.reserve_vault1,
+                self.derived.reserve_vault0,
+            )
         };
 
         Ok(SwapAndAccountMetas {
@@ -311,54 +273,13 @@ impl Amm for OmnipairAmmClient {
 }
 
 // ---------------------------------------------------------------------------
-// Swap account metas
-// ---------------------------------------------------------------------------
-
-pub struct OmnipairSwapAccounts {
-    pub pair: Pubkey,
-    pub rate_model: Pubkey,
-    pub futarchy_authority: Pubkey,
-    pub token_in_vault: Pubkey,
-    pub token_out_vault: Pubkey,
-    pub user_token_in_account: Pubkey,
-    pub user_token_out_account: Pubkey,
-    pub token_in_mint: Pubkey,
-    pub token_out_mint: Pubkey,
-    pub user: Pubkey,
-    pub token_program: Pubkey,
-    pub token_2022_program: Pubkey,
-    pub event_authority: Pubkey,
-    pub omnipair_program: Pubkey,
-}
-
-impl From<OmnipairSwapAccounts> for Vec<AccountMeta> {
-    fn from(accounts: OmnipairSwapAccounts) -> Self {
-        vec![
-            AccountMeta::new(accounts.pair, false),
-            AccountMeta::new(accounts.rate_model, false),
-            AccountMeta::new_readonly(accounts.futarchy_authority, false),
-            AccountMeta::new(accounts.token_in_vault, false),
-            AccountMeta::new(accounts.token_out_vault, false),
-            AccountMeta::new(accounts.user_token_in_account, false),
-            AccountMeta::new(accounts.user_token_out_account, false),
-            AccountMeta::new_readonly(accounts.token_in_mint, false),
-            AccountMeta::new_readonly(accounts.token_out_mint, false),
-            AccountMeta::new(accounts.user, true),
-            AccountMeta::new_readonly(accounts.token_program, false),
-            AccountMeta::new_readonly(accounts.token_2022_program, false),
-            AccountMeta::new_readonly(accounts.event_authority, false),
-            AccountMeta::new_readonly(accounts.omnipair_program, false),
-        ]
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jupiter_amm_interface::{Amm, AmmContext, KeyedAccount, SwapMode, SwapParams};
 
     #[test]
     fn test_constant_product() {
@@ -418,8 +339,8 @@ mod tests {
     #[test]
     #[ignore]
     fn test_onchain() {
-        use solana_rpc_client::rpc_client::RpcClient;
         use solana_commitment_config::CommitmentConfig;
+        use solana_rpc_client::rpc_client::RpcClient;
         use std::collections::HashMap;
         use std::str::FromStr;
 
@@ -449,8 +370,7 @@ mod tests {
         let amm_context = AmmContext {
             clock_ref: jupiter_amm_interface::ClockRef::default(),
         };
-        let mut amm =
-            OmnipairAmmClient::from_keyed_account(&keyed_account, &amm_context).unwrap();
+        let mut amm = OmnipairAmmClient::from_keyed_account(&keyed_account, &amm_context).unwrap();
 
         println!("\n=== Pair State ===");
         println!("  token0:          {}", amm.state.token0);
@@ -469,25 +389,17 @@ mod tests {
         println!("  version:         {}", amm.state.version);
         println!("  reduce_only:     {}", amm.state.reduce_only);
 
-        // -- Derived accounts (computed once in from_keyed_account) --
-        println!("\n=== Derived Accounts (pre-computed) ===");
-        println!("  reserve_vault0:      {}", amm.derived.reserve_vault0);
-        println!("  reserve_vault1:      {}", amm.derived.reserve_vault1);
-        println!("  futarchy_authority:  {}", amm.derived.futarchy_authority);
-        println!("  event_authority:     {}", amm.derived.event_authority);
-
         // -- Update --
         println!("\n=== Update (re-fetch) ===");
         let accounts_to_update = amm.get_accounts_to_update();
         println!("  accounts to update: {:?}", accounts_to_update);
-        let account_map: HashMap<Pubkey, solana_sdk::account::Account, ahash::RandomState> =
-            client
-                .get_multiple_accounts(&accounts_to_update)
-                .unwrap()
-                .into_iter()
-                .zip(accounts_to_update)
-                .filter_map(|(account, pubkey)| account.map(|a| (pubkey, a)))
-                .collect();
+        let account_map: HashMap<Pubkey, solana_sdk::account::Account, ahash::RandomState> = client
+            .get_multiple_accounts(&accounts_to_update)
+            .unwrap()
+            .into_iter()
+            .zip(accounts_to_update)
+            .filter_map(|(account, pubkey)| account.map(|a| (pubkey, a)))
+            .collect();
         amm.update(&account_map).unwrap();
         println!("  update OK");
 
@@ -561,10 +473,20 @@ mod tests {
         println!("  swap variant: {:?}", swap_and_metas.swap);
         println!("  num accounts: {}", swap_and_metas.account_metas.len());
         let labels = [
-            "pair", "rate_model", "futarchy_authority", "token_in_vault",
-            "token_out_vault", "user_token_in", "user_token_out",
-            "token_in_mint", "token_out_mint", "user", "token_program",
-            "token_2022_program", "event_authority", "omnipair_program",
+            "pair",
+            "rate_model",
+            "futarchy_authority",
+            "token_in_vault",
+            "token_out_vault",
+            "user_token_in",
+            "user_token_out",
+            "token_in_mint",
+            "token_out_mint",
+            "user",
+            "token_program",
+            "token_2022_program",
+            "event_authority",
+            "omnipair_program",
         ];
         for (i, meta) in swap_and_metas.account_metas.iter().enumerate() {
             let label = labels.get(i).unwrap_or(&"?");
@@ -583,7 +505,9 @@ mod tests {
             match client.get_account(&meta.pubkey) {
                 Ok(acc) => println!(
                     "  vault{i} {} owner={} data_len={}",
-                    meta.pubkey, acc.owner, acc.data.len()
+                    meta.pubkey,
+                    acc.owner,
+                    acc.data.len()
                 ),
                 Err(e) => println!("  vault{i} {} NOT FOUND: {e}", meta.pubkey),
             }
