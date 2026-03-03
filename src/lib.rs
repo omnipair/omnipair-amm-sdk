@@ -5,8 +5,12 @@ use jupiter_amm_interface::{
     SwapParams,
 };
 use rust_decimal::Decimal;
+use std::sync::atomic::Ordering;
 
+mod interest;
 mod omnipair_amm_client;
+
+pub use interest::{OmnipairFutarchyAuthority, OmnipairRateModel};
 pub use omnipair_amm_client::{OmnipairAmmClient, OmnipairSwapAccounts};
 
 pub const OMNIPAIR_PROGRAM_ID: Pubkey =
@@ -16,11 +20,11 @@ pub const SPL_TOKEN_PROGRAM_ID: Pubkey =
 pub const TOKEN_2022_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
-const BPS_DENOMINATOR: u128 = 10_000;
+pub(crate) const BPS_DENOMINATOR: u128 = 10_000;
 pub(crate) const RESERVE_VAULT_SEED_PREFIX: &[u8] = b"reserve_vault";
 pub(crate) const FUTARCHY_AUTHORITY_SEED_PREFIX: &[u8] = b"futarchy_authority";
 
-fn ceil_div(numerator: u128, denominator: u128) -> Option<u128> {
+pub(crate) fn ceil_div(numerator: u128, denominator: u128) -> Option<u128> {
     if denominator == 0 {
         return None;
     }
@@ -162,7 +166,7 @@ impl OmnipairPair {
 }
 
 impl Amm for OmnipairAmmClient {
-    fn from_keyed_account(keyed_account: &KeyedAccount, _amm_context: &AmmContext) -> Result<Self>
+    fn from_keyed_account(keyed_account: &KeyedAccount, amm_context: &AmmContext) -> Result<Self>
     where
         Self: Sized,
     {
@@ -172,6 +176,9 @@ impl Amm for OmnipairAmmClient {
             pair_key: keyed_account.key,
             state,
             derived,
+            clock_ref: amm_context.clock_ref.clone(),
+            rate_model_data: None,
+            interest_bps: 0,
         })
     }
 
@@ -192,7 +199,11 @@ impl Amm for OmnipairAmmClient {
     }
 
     fn get_accounts_to_update(&self) -> Vec<Pubkey> {
-        vec![self.pair_key]
+        vec![
+            self.pair_key,
+            self.state.rate_model,
+            self.derived.futarchy_authority,
+        ]
     }
 
     fn update(&mut self, account_map: &AccountMap) -> Result<()> {
@@ -201,6 +212,17 @@ impl Amm for OmnipairAmmClient {
             .with_context(|| format!("Pair account not found for key: {}", self.pair_key))?;
         self.state = omnipair_amm_client::deserialize_pair(&pair_account.data)?;
         self.derived = omnipair_amm_client::DerivedAccounts::compute(&self.pair_key, &self.state);
+
+        if let Some(rm_account) = account_map.get(&self.state.rate_model) {
+            self.rate_model_data =
+                Some(omnipair_amm_client::deserialize_rate_model(&rm_account.data)?);
+        }
+
+        if let Some(fa_account) = account_map.get(&self.derived.futarchy_authority) {
+            let fa = omnipair_amm_client::deserialize_futarchy_authority(&fa_account.data)?;
+            self.interest_bps = fa.revenue_share.interest_bps;
+        }
+
         Ok(())
     }
 
@@ -213,9 +235,13 @@ impl Amm for OmnipairAmmClient {
             bail!(OmnipairError::ExactOutNotSupported);
         }
 
-        let result = self
-            .state
-            .swap_quote(quote_params.amount, quote_params.input_mint)?;
+        let mut projected = self.state.clone();
+        if let Some(ref rate_model) = self.rate_model_data {
+            let current_slot = self.clock_ref.slot.load(Ordering::Relaxed);
+            projected.simulate_update(current_slot, rate_model, self.interest_bps);
+        }
+
+        let result = projected.swap_quote(quote_params.amount, quote_params.input_mint)?;
 
         Ok(Quote {
             in_amount: quote_params.amount,
@@ -269,6 +295,10 @@ impl Amm for OmnipairAmmClient {
 
     fn clone_amm(&self) -> Box<dyn Amm + Send + Sync> {
         Box::new(self.clone())
+    }
+
+    fn is_active(&self) -> bool {
+        !self.state.reduce_only
     }
 }
 
@@ -328,6 +358,120 @@ mod tests {
         assert_eq!(result.amount_out, 996006);
     }
 
+    #[test]
+    fn test_simulate_update_no_debt() {
+        let mut pair = OmnipairPair {
+            token0: Pubkey::new_unique(),
+            token1: Pubkey::new_unique(),
+            lp_mint: Pubkey::default(),
+            rate_model: Pubkey::default(),
+            swap_fee_bps: 25,
+            half_life: 3_000,
+            fixed_cf_bps: None,
+            reserve0: 1_000_000_000,
+            reserve1: 1_000_000_000,
+            cash_reserve0: 1_000_000_000,
+            cash_reserve1: 1_000_000_000,
+            last_price0_ema: LastPriceEMA::default(),
+            last_price1_ema: LastPriceEMA::default(),
+            last_update: 100,
+            last_rate0: 200_000_000,
+            last_rate1: 200_000_000,
+            total_debt0: 0,
+            total_debt1: 0,
+            total_debt0_shares: 0,
+            total_debt1_shares: 0,
+            total_supply: 1_000,
+            total_collateral0: 0,
+            total_collateral1: 0,
+            token0_decimals: 9,
+            token1_decimals: 9,
+            params_hash: [0; 32],
+            version: 1,
+            bump: 0,
+            vault_bumps: VaultBumps::default(),
+            reduce_only: false,
+        };
+
+        let rate_model = OmnipairRateModel {
+            exp_rate: 693_147_180 / 86_400_000,
+            target_util_start: 300_000_000,
+            target_util_end: 500_000_000,
+            half_life_ms: 86_400_000,
+            min_rate: 100_000_000,
+            max_rate: 0,
+            initial_rate: 200_000_000,
+        };
+
+        let reserve0_before = pair.reserve0;
+        let reserve1_before = pair.reserve1;
+
+        pair.simulate_update(1100, &rate_model, 1000);
+
+        assert_eq!(pair.reserve0, reserve0_before, "No debt = no reserve change");
+        assert_eq!(pair.reserve1, reserve1_before, "No debt = no reserve change");
+        assert_eq!(pair.last_update, 1100);
+    }
+
+    #[test]
+    fn test_simulate_update_with_debt() {
+        let mut pair = OmnipairPair {
+            token0: Pubkey::new_unique(),
+            token1: Pubkey::new_unique(),
+            lp_mint: Pubkey::default(),
+            rate_model: Pubkey::default(),
+            swap_fee_bps: 25,
+            half_life: 3_000,
+            fixed_cf_bps: None,
+            reserve0: 10_000_000_000,
+            reserve1: 10_000_000_000,
+            cash_reserve0: 5_000_000_000,
+            cash_reserve1: 5_000_000_000,
+            last_price0_ema: LastPriceEMA::default(),
+            last_price1_ema: LastPriceEMA::default(),
+            last_update: 100,
+            last_rate0: 200_000_000,
+            last_rate1: 200_000_000,
+            total_debt0: 5_000_000_000,
+            total_debt1: 5_000_000_000,
+            total_debt0_shares: 0,
+            total_debt1_shares: 0,
+            total_supply: 1_000,
+            total_collateral0: 0,
+            total_collateral1: 0,
+            token0_decimals: 9,
+            token1_decimals: 9,
+            params_hash: [0; 32],
+            version: 1,
+            bump: 0,
+            vault_bumps: VaultBumps::default(),
+            reduce_only: false,
+        };
+
+        let rate_model = OmnipairRateModel {
+            exp_rate: 693_147_180 / 86_400_000,
+            target_util_start: 300_000_000,
+            target_util_end: 500_000_000,
+            half_life_ms: 86_400_000,
+            min_rate: 100_000_000,
+            max_rate: 0,
+            initial_rate: 200_000_000,
+        };
+
+        let reserve0_before = pair.reserve0;
+
+        pair.simulate_update(216100, &rate_model, 1000);
+
+        assert!(
+            pair.reserve0 > reserve0_before,
+            "Reserves should grow with debt: {} > {}",
+            pair.reserve0,
+            reserve0_before
+        );
+        assert!(pair.total_debt0 > 5_000_000_000, "Debt should accrue interest");
+        assert_eq!(pair.last_update, 216100);
+    }
+
     /// Test against a live on-chain Omnipair Pair account.
     ///
     /// To run:
@@ -362,14 +506,18 @@ mod tests {
             "Account owner is not the Omnipair program"
         );
 
+        let current_slot = client.get_slot().unwrap();
+
         let keyed_account = KeyedAccount {
             key: pair_pubkey,
             account: pair_account,
             params: None,
         };
-        let amm_context = AmmContext {
-            clock_ref: jupiter_amm_interface::ClockRef::default(),
-        };
+        let clock_ref = jupiter_amm_interface::ClockRef::default();
+        clock_ref
+            .slot
+            .store(current_slot, std::sync::atomic::Ordering::Relaxed);
+        let amm_context = AmmContext { clock_ref };
         let mut amm = OmnipairAmmClient::from_keyed_account(&keyed_account, &amm_context).unwrap();
 
         println!("\n=== Pair State ===");
@@ -388,8 +536,9 @@ mod tests {
         println!("  bump:            {}", amm.state.bump);
         println!("  version:         {}", amm.state.version);
         println!("  reduce_only:     {}", amm.state.reduce_only);
+        println!("  last_update:     {} (current_slot: {})", amm.state.last_update, current_slot);
 
-        // -- Update --
+        // -- Update (fetches pair + rate_model + futarchy_authority) --
         println!("\n=== Update (re-fetch) ===");
         let accounts_to_update = amm.get_accounts_to_update();
         println!("  accounts to update: {:?}", accounts_to_update);
@@ -402,6 +551,18 @@ mod tests {
             .collect();
         amm.update(&account_map).unwrap();
         println!("  update OK");
+        println!(
+            "  rate_model loaded: {}",
+            amm.rate_model_data.is_some()
+        );
+        println!("  interest_bps:     {}", amm.interest_bps);
+        if let Some(ref rm) = amm.rate_model_data {
+            println!("  rate_model.exp_rate:          {}", rm.exp_rate);
+            println!("  rate_model.target_util_start: {}", rm.target_util_start);
+            println!("  rate_model.target_util_end:   {}", rm.target_util_end);
+            println!("  rate_model.min_rate:          {}", rm.min_rate);
+            println!("  rate_model.max_rate:          {}", rm.max_rate);
+        }
 
         // -- Quote token0 -> token1 --
         let amount_0 = 1000 * 10u64.pow(amm.state.token0_decimals as u32);
