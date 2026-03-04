@@ -1,16 +1,20 @@
 use anchor_lang::prelude::{AccountMeta, AnchorDeserialize, Pubkey};
 use anyhow::Result;
-use jupiter_amm_interface::AmmProgramIdToLabel;
+use jupiter_amm_interface::{AmmProgramIdToLabel, ClockRef};
 
 use crate::{
-    OmnipairPair, FUTARCHY_AUTHORITY_SEED_PREFIX, OMNIPAIR_PROGRAM_ID, RESERVE_VAULT_SEED_PREFIX,
+    OmnipairFutarchyAuthority, OmnipairPair, OmnipairRateModel, FUTARCHY_AUTHORITY_SEED_PREFIX,
+    OMNIPAIR_PROGRAM_ID, RESERVE_VAULT_SEED_PREFIX,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OmnipairAmmClient {
     pub pair_key: Pubkey,
     pub state: OmnipairPair,
     pub(crate) derived: DerivedAccounts,
+    pub(crate) clock_ref: ClockRef,
+    pub(crate) rate_model_data: Option<OmnipairRateModel>,
+    pub(crate) interest_bps: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +66,20 @@ pub(crate) fn deserialize_pair(data: &[u8]) -> Result<OmnipairPair> {
         anyhow::bail!(crate::OmnipairError::InvalidAccountData);
     }
     Ok(OmnipairPair::deserialize(&mut &data[8..])?)
+}
+
+pub(crate) fn deserialize_rate_model(data: &[u8]) -> Result<OmnipairRateModel> {
+    if data.len() < 8 {
+        anyhow::bail!(crate::OmnipairError::InvalidAccountData);
+    }
+    Ok(OmnipairRateModel::deserialize(&mut &data[8..])?)
+}
+
+pub(crate) fn deserialize_futarchy_authority(data: &[u8]) -> Result<OmnipairFutarchyAuthority> {
+    if data.len() < 8 {
+        anyhow::bail!(crate::OmnipairError::InvalidAccountData);
+    }
+    Ok(OmnipairFutarchyAuthority::deserialize(&mut &data[8..])?)
 }
 
 pub struct OmnipairSwapAccounts {
